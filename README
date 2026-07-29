@@ -465,6 +465,56 @@ file timestamps. Using FAKETIME_XRESET should be considered experimental at
 the moment.
 
 
+Lock-free shared virtual clock
+------------------------------
+
+Applications that update fake time frequently can opt into an in-memory
+realtime clock instead of setting FAKETIME_NO_CACHE=1 and rereading a timestamp
+file on every intercepted call:
+
+  LD_PRELOAD=/path/to/libfaketimeMT.so.1 \
+    FAKETIME_SHARED_CLOCK=1 \
+    FAKETIME_SHARED_CLOCK_INITIAL_NS=946684800000000000 \
+    FAKETIME_DONT_FAKE_MONOTONIC=1 \
+    ./some-program
+
+FAKETIME_SHARED_CLOCK_INITIAL_NS is an optional signed Unix epoch in integer
+nanoseconds. If it is omitted, the shared clock initially matches real
+CLOCK_REALTIME. The process that first loads libfaketime creates a versioned
+POSIX shared-memory page and records its name in the internal
+FAKETIME_SHARED_CLOCK_SHM environment variable. Forked children retain the
+mapping and exec'd children attach to that name during library initialization.
+
+The shared clock affects CLOCK_REALTIME, CLOCK_REALTIME_COARSE where available,
+gettimeofday(), and time(). Other clocks retain normal libfaketime behavior;
+FAKETIME_DONT_FAKE_MONOTONIC=1 remains recommended when monotonic durations must
+not jump with simulated wall time.
+
+The current process can update the mapped clock through this exported API from
+faketime_shared_clock.h:
+
+  int faketime_shared_clock_available(void);
+  int faketime_set_realtime_ns(int64_t target_ns);
+
+The update function captures unfaked CLOCK_REALTIME internally and publishes a
+new real/fake base pair with a sequence counter. Readers perform atomic loads,
+one call through the resolved real clock function, and integer arithmetic. They
+do not open, stat, read, parse, allocate, or take a process-shared lock. The
+low-level API permits backward updates; callers that require monotonically
+advancing simulated wall time must enforce that policy themselves.
+
+If FAKETIME_SHARED_CLOCK is absent or is not exactly "1", timestamp files and
+all other legacy configuration paths are unchanged. A process that explicitly
+requests shared mode but attaches to an incompatible layout prints an error;
+faketime_shared_clock_available() then returns 0 with errno set.
+
+Build the library with `make` (or, when selecting a compiler explicitly,
+`make CC=/usr/bin/gcc`). The shared-clock mode requires POSIX shared memory and
+lock-free 64-bit atomics. Its named object follows libfaketime's existing
+best-effort cleanup model: abnormal termination can leave a stale
+/dev/shm/faketime_clock_* object.
+
+
 Cleaning up shared memory
 -------------------------
 
@@ -480,7 +530,8 @@ shared memory cannot be cleaned up properly. In such
 cases, you should occasionally delete
 
   /dev/shm/faketime_shm_* and
-  /dev/shm/sem.faketime_sem_*
+  /dev/shm/sem.faketime_sem_* and
+  /dev/shm/faketime_clock_*
 
 manually (or properly automated). Leftover files there from processes that
 already have been terminated are not a problem in general, but result in a

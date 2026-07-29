@@ -1,0 +1,12 @@
+Linux tuolumne2151 4.18.0-553.126.1.1toss.t4.x86_64 #1 SMP Thu Jun 4 13:09:32 PDT 2026 x86_64 x86_64 x86_64 GNU/Linux
+hostname=tuolumne2151
+cpu_model=AMD Instinct MI300A Accelerator
+allowed_cpus=0-95
+benchmark_cpu=0
+compiler=gcc (GCC) 8.5.0 20210514 (Red Hat 8.5.0-28)
+compiler_flags=-O2 -std=gnu11 -Wall -Wextra -Werror
+libfaketime_head_at_run=d79bf0ff80f97900b339bead46590b474abd4b62
+libfaketime_diff=15 changed paths
+calls=1000000
+repetitions=9
+update_calls=1000

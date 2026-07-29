@@ -159,7 +159,7 @@ LIB_LDFLAGS += -shared
 LDFLAGS += $(FAKETIME_LINK_FLAGS)
 ifneq ($(PLATFORM),SunOS)
 ifndef IS_ANDROID
-LDFLAGS += -Wl,--version-script=libfaketime.map
+LIB_LDFLAGS += -Wl,--version-script=libfaketime.map
 endif
 endif
 
@@ -185,7 +185,7 @@ libfaketimeMT.o: EXTRA_FLAGS := -DPTHREAD_SINGLETHREADED_TIME
 ft_sem.o: ft_sem.c ft_sem.h
 	${CC} -o $@ -c ${CFLAGS} ${CPPFLAGS} $<
 
-${LIBS_OBJ}: libfaketime.c ft_sem.h
+${LIBS_OBJ}: libfaketime.c faketime_shared_clock.h ft_sem.h
 	${CC} -o $@ -c ${CFLAGS} ${CPPFLAGS} ${EXTRA_FLAGS} $<
 
 %.so.${SONAME}: %.o ft_sem.o libfaketime.map

@@ -28,12 +28,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <inttypes.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
 #ifdef __linux__
 #include <sys/epoll.h>
+#include <sys/syscall.h>
 #endif
 #ifdef __GLIBC__
 #ifndef __APPLE__
@@ -75,6 +78,7 @@
 #include "android_compat.h"
 #include "time_ops.h"
 #include "faketime_common.h"
+#include "faketime_shared_clock.h"
 #include "ft_sem.h"
 
 #if defined PTHREAD_SINGLETHREADED_TIME && defined FAKE_STATELESS
@@ -366,6 +370,9 @@ static int    fake_gettimeofday(struct timeval *tv);
 static int    fake_clock_gettime(clockid_t clk_id, struct timespec *tp);
 static int    fake_current_realtime(struct timespec *tp);
 static int    fake_current_timeval(struct timeval *tv);
+static int    ft_shared_clock_read(clockid_t clk_id, struct timespec *tp);
+static bool   ft_shared_clock_supports(clockid_t clk_id);
+static void   ft_shared_clock_init(void);
 int           read_config_file();
 bool          str_array_contains(const char *haystack, const char *needle);
 void *ft_dlvsym(void *handle, const char *symbol, const char *version, const char *full_name, char *ignore_list, bool should_debug_dlsym);
@@ -377,6 +384,19 @@ static bool shared_sem_initialized = false;
 
 /** Data shared among faketime-spawned processes */
 static struct ft_shared_s *ft_shared = NULL;
+
+/**
+ * Opt-in virtual realtime clock mapped once during initialization.
+ *
+ * FAKETIME_SHARED_CLOCK_SHM is an internal identity propagated through the
+ * environment exactly as FAKETIME_SHARED is.  Forked children retain this
+ * mapping and exec'd children attach to the same named POSIX shared memory.
+ */
+static struct ft_shared_virtual_clock *ft_shared_clock = NULL;
+static bool ft_shared_clock_enabled = false;
+static bool ft_shared_clock_creator = false;
+static pid_t ft_shared_clock_creator_pid = (pid_t)-1;
+static int ft_shared_clock_init_errno = ENODEV;
 
 /** Storage format for timestamps written to file. Big endian. */
 struct saved_timestamp
@@ -771,8 +791,493 @@ static void ft_shm_really_init (void)
   }
 }
 
+/*
+ *      =======================================================================
+ *      Lock-free shared virtual clock                              === SHMCLK
+ *      =======================================================================
+ */
+
+static pid_t ft_real_getpid_value(void)
+{
+#ifdef FAKE_PID
+  if (real_getpid != NULL)
+  {
+    return real_getpid();
+  }
+#endif
+  return getpid();
+}
+
+static bool ft_env_is_one(const char *name)
+{
+  const char *value = getenv(name);
+  return (value != NULL) && (strcmp(value, "1") == 0);
+}
+
+static int ft_timespec_to_ns(const struct timespec *ts, int64_t *ns_out)
+{
+  __int128 value;
+
+  if ((ts == NULL) || (ns_out == NULL) || (ts->tv_nsec < 0) ||
+      (ts->tv_nsec >= SEC_TO_nSEC))
+  {
+    errno = EINVAL;
+    return -1;
+  }
+
+  value = ((__int128)ts->tv_sec * SEC_TO_nSEC) + ts->tv_nsec;
+  if ((value < INT64_MIN) || (value > INT64_MAX))
+  {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  *ns_out = (int64_t)value;
+  return 0;
+}
+
+static int ft_ns_to_timespec(__int128 ns, struct timespec *ts)
+{
+  __int128 sec;
+  __int128 nsec;
+  time_t converted_sec;
+
+  sec = ns / SEC_TO_nSEC;
+  nsec = ns % SEC_TO_nSEC;
+  if (nsec < 0)
+  {
+    nsec += SEC_TO_nSEC;
+    sec--;
+  }
+  converted_sec = (time_t)sec;
+  if ((__int128)converted_sec != sec)
+  {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  ts->tv_sec = converted_sec;
+  ts->tv_nsec = (long)nsec;
+  return 0;
+}
+
+static int ft_shared_clock_real_ns(clockid_t clk_id, int64_t *ns_out)
+{
+  struct timespec ts;
+  int result;
+
+  if (real_clock_gettime == NULL)
+  {
+    errno = ENOSYS;
+    return -1;
+  }
+  DONT_FAKE_TIME(result = (*real_clock_gettime)(clk_id, &ts));
+  if (result == -1)
+  {
+    return -1;
+  }
+  return ft_timespec_to_ns(&ts, ns_out);
+}
+
+static int ft_shared_clock_initial_target(int64_t real_ns, int64_t *target_ns)
+{
+  const char *value = getenv(FAKETIME_SHARED_CLOCK_INITIAL_NS_ENV);
+  char *end = NULL;
+  intmax_t parsed;
+
+  if ((value == NULL) || (*value == '\0'))
+  {
+    *target_ns = real_ns;
+    return 0;
+  }
+
+  errno = 0;
+  parsed = strtoimax(value, &end, 10);
+  if ((errno != 0) || (end == value) || (*end != '\0') ||
+      (parsed < INT64_MIN) || (parsed > INT64_MAX))
+  {
+    errno = EINVAL;
+    return -1;
+  }
+  *target_ns = (int64_t)parsed;
+  return 0;
+}
+
+static int ft_shared_clock_init_page(struct ft_shared_virtual_clock *page,
+                                     pid_t creator_pid)
+{
+  int64_t real_ns;
+  int64_t coarse_ns;
+  int64_t target_ns;
+
+  if (ft_shared_clock_real_ns(CLOCK_REALTIME, &real_ns) == -1)
+  {
+    return -1;
+  }
+  coarse_ns = real_ns;
+#ifdef CLOCK_REALTIME_COARSE
+  if (ft_shared_clock_real_ns(CLOCK_REALTIME_COARSE, &coarse_ns) == -1)
+  {
+    coarse_ns = real_ns;
+  }
+#endif
+  if (ft_shared_clock_initial_target(real_ns, &target_ns) == -1)
+  {
+    return -1;
+  }
+
+  memset(page, 0, sizeof(*page));
+  page->magic = FT_SHARED_CLOCK_MAGIC;
+  page->version = FT_SHARED_CLOCK_VERSION;
+  atomic_init(&page->sequence, UINT64_C(0));
+  atomic_init(&page->realtime_real_base_ns, real_ns);
+  atomic_init(&page->realtime_fake_base_ns, target_ns);
+  atomic_init(&page->realtime_coarse_real_base_ns, coarse_ns);
+  atomic_init(&page->flags, FT_SHARED_CLOCK_FLAG_ACTIVE);
+  page->reserved = 0;
+  page->creator_pid = (int64_t)creator_pid;
+
+  if (!atomic_is_lock_free(&page->sequence) ||
+      !atomic_is_lock_free(&page->realtime_real_base_ns))
+  {
+    errno = ENOTSUP;
+    return -1;
+  }
+  return 0;
+}
+
+static int ft_shared_clock_validate_page(struct ft_shared_virtual_clock *page)
+{
+  if ((page->magic != FT_SHARED_CLOCK_MAGIC) ||
+      (page->version != FT_SHARED_CLOCK_VERSION))
+  {
+    errno = EPROTO;
+    return -1;
+  }
+  if (!atomic_is_lock_free(&page->sequence) ||
+      !atomic_is_lock_free(&page->realtime_real_base_ns))
+  {
+    errno = ENOTSUP;
+    return -1;
+  }
+  return 0;
+}
+
+static void ft_shared_clock_init(void)
+{
+  const char *inherited_name;
+  char created_name[128];
+  struct ft_shared_virtual_clock *page = MAP_FAILED;
+  struct stat sb;
+  pid_t pid;
+  int fd = -1;
+  int saved_errno = ENODEV;
+  unsigned int attempt;
+  bool created = false;
+
+  if (!ft_env_is_one(FAKETIME_SHARED_CLOCK_ENV))
+  {
+    return;
+  }
+
+  inherited_name = getenv(FAKETIME_SHARED_CLOCK_SHM_ENV);
+  pid = ft_real_getpid_value();
+  if ((inherited_name != NULL) && (*inherited_name != '\0'))
+  {
+    fd = shm_open(inherited_name, O_RDWR, S_IRUSR | S_IWUSR);
+  }
+  else
+  {
+    for (attempt = 0; attempt < 32; attempt++)
+    {
+      snprintf(created_name, sizeof(created_name), "/faketime_clock_%ld_%u",
+               (long)pid, attempt);
+      fd = shm_open(created_name, O_CREAT | O_EXCL | O_RDWR,
+                    S_IRUSR | S_IWUSR);
+      if (fd != -1)
+      {
+        created = true;
+        inherited_name = created_name;
+        break;
+      }
+      if (errno != EEXIST)
+      {
+        break;
+      }
+    }
+  }
+
+  if (fd == -1)
+  {
+    saved_errno = errno;
+    goto fail;
+  }
+  if (created)
+  {
+    if (ftruncate(fd, sizeof(*page)) == -1)
+    {
+      saved_errno = errno;
+      goto fail;
+    }
+  }
+  else
+  {
+    int result;
+#if defined(__linux__) && defined(SYS_fstat)
+    DONT_FAKE_TIME(result = (int)syscall(SYS_fstat, fd, &sb));
+#else
+    if (real_fstat == NULL)
+    {
+      saved_errno = ENOSYS;
+      goto fail;
+    }
+    DONT_FAKE_TIME(result = (*real_fstat)(fd, &sb));
+#endif
+    if (result == -1)
+    {
+      saved_errno = errno;
+      goto fail;
+    }
+    if (sb.st_size != (off_t)sizeof(*page))
+    {
+      saved_errno = EPROTO;
+      goto fail;
+    }
+  }
+
+  page = mmap(NULL, sizeof(*page), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (page == MAP_FAILED)
+  {
+    saved_errno = errno;
+    goto fail;
+  }
+  close(fd);
+  fd = -1;
+
+  if (created)
+  {
+    if (ft_shared_clock_init_page(page, pid) == -1)
+    {
+      saved_errno = errno;
+      goto fail;
+    }
+    if (setenv(FAKETIME_SHARED_CLOCK_SHM_ENV, inherited_name, true) == -1)
+    {
+      saved_errno = errno;
+      goto fail;
+    }
+  }
+  else if (ft_shared_clock_validate_page(page) == -1)
+  {
+    saved_errno = errno;
+    goto fail;
+  }
+
+  ft_shared_clock = page;
+  ft_shared_clock_enabled = true;
+  ft_shared_clock_creator_pid = (pid_t)page->creator_pid;
+  ft_shared_clock_creator = (ft_shared_clock_creator_pid == pid);
+  ft_shared_clock_init_errno = 0;
+  return;
+
+fail:
+  if (page != MAP_FAILED)
+  {
+    munmap(page, sizeof(*page));
+  }
+  if (fd != -1)
+  {
+    close(fd);
+  }
+  if (created)
+  {
+    shm_unlink(inherited_name);
+  }
+  ft_shared_clock_init_errno = saved_errno;
+  errno = saved_errno;
+  fprintf(stderr,
+          "libfaketime: %s=1 requested, but shared clock initialization "
+          "failed: %s\n",
+          FAKETIME_SHARED_CLOCK_ENV, strerror(saved_errno));
+}
+
+static bool ft_shared_clock_supports(clockid_t clk_id)
+{
+  if (clk_id == CLOCK_REALTIME)
+  {
+    return true;
+  }
+#ifdef CLOCK_REALTIME_COARSE
+  if (clk_id == CLOCK_REALTIME_COARSE)
+  {
+    return true;
+  }
+#endif
+  return false;
+}
+
+/*
+ * Read protocol:
+ *
+ *   1. acquire an even sequence;
+ *   2. obtain unfaked realtime;
+ *   3. load the bases using relaxed atomics;
+ *   4. acquire and compare the sequence;
+ *   5. apply fake_base + (real_now - real_base).
+ *
+ * The writer's final release store publishes every relaxed payload store.  A
+ * retry is required if a writer was active or published during the sample.
+ */
+static int ft_shared_clock_read(clockid_t clk_id, struct timespec *tp)
+{
+  uint64_t before;
+  uint64_t after;
+  int64_t real_now_ns;
+  int64_t real_base_ns;
+  int64_t fake_base_ns;
+  uint32_t flags;
+
+  if (!ft_shared_clock_enabled || (ft_shared_clock == NULL))
+  {
+    errno = ENODEV;
+    return -1;
+  }
+  if (!ft_shared_clock_supports(clk_id))
+  {
+    errno = ENOTSUP;
+    return -1;
+  }
+
+  for (;;)
+  {
+    before = atomic_load_explicit(&ft_shared_clock->sequence,
+                                  memory_order_acquire);
+    if ((before & UINT64_C(1)) != 0)
+    {
+      continue;
+    }
+    if (ft_shared_clock_real_ns(clk_id, &real_now_ns) == -1)
+    {
+      return -1;
+    }
+#ifdef CLOCK_REALTIME_COARSE
+    if (clk_id == CLOCK_REALTIME_COARSE)
+    {
+      real_base_ns = atomic_load_explicit(
+          &ft_shared_clock->realtime_coarse_real_base_ns,
+          memory_order_relaxed);
+    }
+    else
+#endif
+    {
+      real_base_ns = atomic_load_explicit(
+          &ft_shared_clock->realtime_real_base_ns, memory_order_relaxed);
+    }
+    fake_base_ns = atomic_load_explicit(
+        &ft_shared_clock->realtime_fake_base_ns, memory_order_relaxed);
+    flags = atomic_load_explicit(&ft_shared_clock->flags,
+                                 memory_order_relaxed);
+    after = atomic_load_explicit(&ft_shared_clock->sequence,
+                                 memory_order_acquire);
+    if ((before == after) && ((after & UINT64_C(1)) == 0))
+    {
+      if ((flags & FT_SHARED_CLOCK_FLAG_ACTIVE) == 0)
+      {
+        errno = ENODEV;
+        return -1;
+      }
+      return ft_ns_to_timespec((__int128)fake_base_ns + real_now_ns -
+                                   real_base_ns,
+                               tp);
+    }
+  }
+}
+
+int faketime_shared_clock_available(void)
+{
+  ftpl_init();
+  if (ft_shared_clock_enabled && (ft_shared_clock != NULL) &&
+      ((atomic_load_explicit(&ft_shared_clock->flags, memory_order_acquire) &
+        FT_SHARED_CLOCK_FLAG_ACTIVE) != 0))
+  {
+    return 1;
+  }
+  errno = ft_shared_clock_init_errno;
+  return 0;
+}
+
+int faketime_set_realtime_ns(int64_t target_ns)
+{
+  uint64_t sequence;
+  uint64_t claimed;
+  int64_t real_ns;
+  int64_t coarse_ns;
+
+  ftpl_init();
+  if (!ft_shared_clock_enabled || (ft_shared_clock == NULL))
+  {
+    errno = ft_shared_clock_init_errno;
+    return -1;
+  }
+  if (ft_shared_clock_real_ns(CLOCK_REALTIME, &real_ns) == -1)
+  {
+    return -1;
+  }
+  coarse_ns = real_ns;
+#ifdef CLOCK_REALTIME_COARSE
+  if (ft_shared_clock_real_ns(CLOCK_REALTIME_COARSE, &coarse_ns) == -1)
+  {
+    coarse_ns = real_ns;
+  }
+#endif
+
+  /* CAS serializes the rare case of multiple writers without a semaphore. */
+  for (;;)
+  {
+    sequence = atomic_load_explicit(&ft_shared_clock->sequence,
+                                    memory_order_acquire);
+    if ((sequence & UINT64_C(1)) != 0)
+    {
+      continue;
+    }
+    claimed = sequence + UINT64_C(1);
+    if (atomic_compare_exchange_weak_explicit(
+            &ft_shared_clock->sequence, &sequence, claimed,
+            memory_order_acquire, memory_order_relaxed))
+    {
+      break;
+    }
+  }
+
+  atomic_store_explicit(&ft_shared_clock->realtime_real_base_ns, real_ns,
+                        memory_order_relaxed);
+  atomic_store_explicit(&ft_shared_clock->realtime_fake_base_ns, target_ns,
+                        memory_order_relaxed);
+  atomic_store_explicit(&ft_shared_clock->realtime_coarse_real_base_ns,
+                        coarse_ns, memory_order_relaxed);
+  atomic_store_explicit(&ft_shared_clock->flags, FT_SHARED_CLOCK_FLAG_ACTIVE,
+                        memory_order_relaxed);
+  atomic_store_explicit(&ft_shared_clock->sequence, claimed + UINT64_C(1),
+                        memory_order_release);
+  return 0;
+}
+
 static void ft_cleanup (void)
 {
+  const char *shared_clock_name;
+
+  if (ft_shared_clock != NULL)
+  {
+    munmap(ft_shared_clock, sizeof(*ft_shared_clock));
+    ft_shared_clock = NULL;
+  }
+  if (ft_shared_clock_creator &&
+      (ft_real_getpid_value() == ft_shared_clock_creator_pid))
+  {
+    shared_clock_name = getenv(FAKETIME_SHARED_CLOCK_SHM_ENV);
+    if ((shared_clock_name != NULL) && (*shared_clock_name != '\0'))
+    {
+      shm_unlink(shared_clock_name);
+    }
+  }
   /* detach from shared memory */
   if (ft_shared != NULL)
   {
@@ -2501,6 +3006,16 @@ time_t time(time_t *time_tptr)
   int result;
 
   ftpl_init();
+  if (ft_shared_clock_enabled)
+  {
+    result = ft_shared_clock_read(CLOCK_REALTIME, &tp);
+    if (result == -1) return -1;
+    if (time_tptr != NULL)
+    {
+      *time_tptr = tp.tv_sec;
+    }
+    return tp.tv_sec;
+  }
 #ifdef MACOS_DYLD_INTERPOSE
   DONT_FAKE_TIME(result = (*clock_gettime)(CLOCK_REALTIME, &tp));
 #else
@@ -2599,6 +3114,16 @@ int gettimeofday(struct timeval *tv, void *tz)
     return -1;
   }
 
+  if (ft_shared_clock_enabled)
+  {
+    struct timespec tp;
+    result = ft_shared_clock_read(CLOCK_REALTIME, &tp);
+    if (result == -1) return result;
+    tv->tv_sec = tp.tv_sec;
+    tv->tv_usec = tp.tv_nsec / 1000;
+    return 0;
+  }
+
   /* Check whether we've got a pointer to the real ftime() function yet */
   if (!CHECK_MISSING_REAL(gettimeofday)) return -1;
 
@@ -2634,6 +3159,11 @@ int clock_gettime(clockid_t clk_id, struct timespec *tp)
   if (tp == NULL)
   {
     return -1;
+  }
+
+  if (ft_shared_clock_enabled && ft_shared_clock_supports(clk_id))
+  {
+    return ft_shared_clock_read(clk_id, tp);
   }
 
   if (!CHECK_MISSING_REAL(clock_gettime)) return -1;
@@ -3140,6 +3670,17 @@ static void ftpl_really_init(void)
     ft_shm_init();
   }
 #endif
+#ifdef FAKE_STATELESS
+  if (ft_env_is_one(FAKETIME_SHARED_CLOCK_ENV))
+  {
+    ft_shared_clock_init_errno = ENOTSUP;
+    fprintf(stderr,
+            "libfaketime: %s=1 is incompatible with a FAKE_STATELESS build\n",
+            FAKETIME_SHARED_CLOCK_ENV);
+  }
+#else
+  ft_shared_clock_init();
+#endif
 #ifdef FAKE_STAT
   if (getenv("NO_FAKE_STAT")!=NULL)
   {
@@ -3367,7 +3908,12 @@ static void ftpl_really_init(void)
     system_time_from_system(&ftpl_starttime);
   }
   /* fake time supplied as environment variable? */
-  if (NULL != (tmp_env = getenv("FAKETIME")))
+  if (ft_shared_clock_enabled)
+  {
+    /* Realtime calls bypass the text configuration path in shared mode. */
+    parse_config_file = false;
+  }
+  else if (NULL != (tmp_env = getenv("FAKETIME")))
   {
     parse_config_file = false;
     parse_ft_string(tmp_env);
@@ -3560,6 +4106,12 @@ int fake_clock_gettime(clockid_t clk_id, struct timespec *tp)
   tp_save.tv_nsec = tp->tv_nsec;
 
   if (dont_fake) return 0;
+
+  if (ft_shared_clock_enabled && ft_shared_clock_supports(clk_id))
+  {
+    return ft_shared_clock_read(clk_id, tp);
+  }
+
   /* Per process timers are only sped up or slowed down */
   if ((clk_id == CLOCK_PROCESS_CPUTIME_ID ) || (clk_id == CLOCK_THREAD_CPUTIME_ID))
   {
@@ -3909,6 +4461,16 @@ int __gettimeofday(struct timeval *tv, void *tz)
     return -1;
   }
 
+  if (ft_shared_clock_enabled)
+  {
+    struct timespec tp;
+    result = ft_shared_clock_read(CLOCK_REALTIME, &tp);
+    if (result == -1) return result;
+    tv->tv_sec = tp.tv_sec;
+    tv->tv_usec = tp.tv_nsec / 1000;
+    return 0;
+  }
+
   /* Check whether we've got a pointer to the real ftime() function yet */
   if (!CHECK_MISSING_REAL(__gettimeofday)) return -1;
 
@@ -3931,6 +4493,11 @@ int __clock_gettime(clockid_t clk_id, struct timespec *tp)
   if (tp == NULL)
   {
     return -1;
+  }
+
+  if (ft_shared_clock_enabled && ft_shared_clock_supports(clk_id))
+  {
+    return ft_shared_clock_read(clk_id, tp);
   }
 
   if (!CHECK_MISSING_REAL(__clock_gettime)) return -1;
@@ -3961,6 +4528,17 @@ time_t __time(time_t *time_tptr)
 {
   struct timespec tp;
   int result;
+
+  if (ft_shared_clock_enabled)
+  {
+    result = ft_shared_clock_read(CLOCK_REALTIME, &tp);
+    if (result == -1) return -1;
+    if (time_tptr != NULL)
+    {
+      *time_tptr = tp.tv_sec;
+    }
+    return tp.tv_sec;
+  }
 
   DONT_FAKE_TIME(result = (*real_clock_gettime)(CLOCK_REALTIME, &tp));
   if (result == -1) return -1;
@@ -4649,7 +5227,9 @@ long syscall(long number, ...) {
 // static int (*real_clock_gettime) (clockid_t clk_id, struct timespec *tp);
   /* Intercept clock_gettime syscall if available */
 #ifdef __NR_clock_gettime
-  if (number == __NR_clock_gettime && (getenv("FAKETIME") || getenv("FAKETIME_TIMESTAMP_FILE"))) {
+  if (number == __NR_clock_gettime &&
+      (getenv("FAKETIME") || getenv("FAKETIME_TIMESTAMP_FILE") ||
+       ft_env_is_one(FAKETIME_SHARED_CLOCK_ENV))) {
     clockid_t clk_id;
     struct timespec *tp;
     clk_id = va_arg(ap, clockid_t);

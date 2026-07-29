@@ -2,6 +2,7 @@ GLIBC_2.2 {
   global:
 
   timer_gettime; timer_settime;
+  faketime_shared_clock_available; faketime_set_realtime_ns;
   local: timer_settime_*; timer_gettime_*;
 };
 
@@ -18,4 +19,3 @@ GLIBC_2.2.5 {
 GLIBC_2.3.2 {
   pthread_cond_timedwait; pthread_cond_init; pthread_cond_destroy;
 } GLIBC_2.2.5;
-
